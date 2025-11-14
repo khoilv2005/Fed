@@ -5,6 +5,8 @@ benv/
 # IDE and editor folders
 .claude/
 
+./data
+
 # Data files
 *.csv
 *.npz
