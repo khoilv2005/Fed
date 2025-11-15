@@ -26,17 +26,6 @@ from datetime import datetime
 from tqdm.auto import tqdm  # ✅ Thêm tqdm cho progress bar
 import time  # ✅ Để đo thời gian mỗi batch
 
-# ============================================================================
-# 🔧 THIẾT LẬP MULTIPROCESSING CHO CUDA
-# ============================================================================
-# QUAN TRỌNG: Đặt start method cho multiprocessing là 'spawn' để tương thích với CUDA
-# 'spawn' tạo process hoàn toàn mới, tránh conflict với CUDA context
-try:
-    mp.set_start_method('spawn', force=True)
-except RuntimeError:
-    # Nếu start method đã được set rồi, bỏ qua
-    pass
-
 
 # Hàm check gpu
 def check_and_setup_gpu(config: Dict) -> str:
@@ -1043,6 +1032,9 @@ def _client_training_worker(args_tuple):
     try:
         (client_id, model_state_dict, train_data, device_id, config) = args_tuple
 
+        # Debug: In ra để biết worker đã start
+        print(f"   🚀 Worker cho Client {client_id} đã start (device: {device_id})")
+
         num_epochs = config['local_epochs']
         learning_rate = config['learning_rate']
         algorithm = config['algorithm']
@@ -1241,6 +1233,7 @@ def train_round_multiprocessing(
     ]
 
     print(f"   • Bắt đầu train {config['num_clients']} clients song song với {config['num_processes']} processes...")
+    print(f"   • Đang khởi tạo process pool...")
 
     # QUAN TRỌNG: Sử dụng 'spawn' context cho CUDA compatibility
     mp_context = mp.get_context('spawn')
@@ -1248,29 +1241,40 @@ def train_round_multiprocessing(
 
     try:
         # Tạo pool với số processes được cấu hình
-        with mp_context.Pool(processes=config['num_processes']) as pool:
-            # Sử dụng imap_unordered để có thể xử lý results ngay khi sẵn sàng
-            for res in tqdm(
-                pool.imap_unordered(_client_training_worker, args_list),
-                total=len(args_list),
-                desc="🔄 Clients Training (Parallel)",
-                unit="client",
-                colour='green'
-            ):
-                if res is not None:
-                    results.append(res)
-                    print(f"   ✓ Client {res['client_id']} hoàn thành - Loss: {res['loss']:.4f}")
-                else:
-                    print(f"   ✗ Một client thất bại (trả về None)")
+        print(f"   • Tạo pool với {config['num_processes']} processes...")
+        pool = mp_context.Pool(processes=config['num_processes'])
 
-            # Đảm bảo pool kết thúc đúng cách
-            pool.close()
-            pool.join()
+        print(f"   • Pool đã được tạo, bắt đầu submit {len(args_list)} tasks...")
+
+        # Sử dụng imap_unordered để có thể xử lý results ngay khi sẵn sàng
+        for idx, res in enumerate(tqdm(
+            pool.imap_unordered(_client_training_worker, args_list),
+            total=len(args_list),
+            desc="🔄 Clients Training (Parallel)",
+            unit="client"
+        )):
+            if res is not None:
+                results.append(res)
+                print(f"   ✓ Client {res['client_id']} hoàn thành - Loss: {res['loss']:.4f}")
+            else:
+                print(f"   ✗ Một client thất bại (trả về None)")
+
+        # Đảm bảo pool kết thúc đúng cách
+        print(f"   • Đang đóng pool...")
+        pool.close()
+        pool.join()
+        print(f"   • Pool đã được đóng thành công")
 
     except Exception as e:
         print(f"   ❌ Lỗi trong quá trình multiprocessing: {e}")
         import traceback
         traceback.print_exc()
+        # Cố gắng terminate pool nếu có lỗi
+        try:
+            pool.terminate()
+            pool.join()
+        except:
+            pass
         raise
 
     # Kiểm tra kết quả
@@ -1676,6 +1680,18 @@ def evaluate_and_save_results(server, history, config, output_dir, data_stats, t
 # ============================================================================
 
 def main():
+    # ============================================================================
+    # 🔧 THIẾT LẬP MULTIPROCESSING CHO CUDA
+    # ============================================================================
+    # QUAN TRỌNG: Set start method PHẢI được gọi trong main() và được bảo vệ
+    # bởi if __name__ == "__main__": để tránh issues khi spawn processes
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("✅ Đã thiết lập multiprocessing start method: 'spawn'")
+    except RuntimeError as e:
+        # Start method đã được set rồi, không cần set lại
+        print(f"ℹ️  Multiprocessing start method đã được thiết lập trước đó: {mp.get_start_method()}")
+
     config = CONFIG
     start_time = datetime.now()
 
