@@ -102,8 +102,15 @@ CONFIG = {
     'force_gpu': True,  # Set False nếu muốn cho phép chạy trên CPU
 
     # Multiprocessing
-    'use_multiprocessing': False,  # Chạy clients song song
-    'num_processes': 1,           # Giảm số processes cho chạy thử nghiệm nhanh
+    'use_multiprocessing': True,   # Chạy clients song song
+    'num_processes': 2,            # QUAN TRỌNG: Với 2 GPUs, dùng 2 processes (1 process/GPU)
+                                   # - Tránh nhiều processes cùng dùng 1 GPU gây OOM
+                                   # - Mỗi process sẽ train 1 client tại 1 thời điểm
+                                   # - Pool sẽ tự động lấy client tiếp theo khi worker rảnh
+                                   # Lưu ý:
+                                   # - Với 1 GPU: num_processes = 1
+                                   # - Với 2 GPUs: num_processes = 2 (khuyến nghị)
+                                   # - Với 4+ GPUs: num_processes = num_gpus
 
     # Visualization
     'eval_every': 1,
@@ -901,13 +908,59 @@ def initialize_federated_system(
 
 
 # ============================================================================
-# 💡 BƯỚC 8: CÁC HÀM HỖ TRỢ MULTIPROCESSING 💡
+# 💡 BƯỚC 8: IMPORT WORKER MODULE (QUAN TRỌNG CHO MULTIPROCESSING)
+# ============================================================================
+# QUAN TRỌNG: Worker function PHẢI ở file riêng để spawn method có thể import.
+# Jupyter/Kaggle không thể pickle functions trong __main__ module.
+
+try:
+    from federated_worker import client_training_worker
+    WORKER_MODULE_AVAILABLE = True
+    print("✅ Đã import federated_worker module thành công")
+except ImportError as e:
+    print(f"⚠️  CẢNH BÁO: Không thể import federated_worker module: {e}")
+    print(f"   Multiprocessing sẽ KHÔNG hoạt động trong Jupyter/Kaggle!")
+    print(f"   Giải pháp: Tạo file federated_worker.py hoặc tắt multiprocessing")
+    WORKER_MODULE_AVAILABLE = False
+    client_training_worker = None
+
+# ============================================================================
+# 💡 CÁC HÀM HỖ TRỢ MULTIPROCESSING 💡
+# ============================================================================
+#
+# 🚀 HƯỚNG DẪN SỬ DỤNG MULTIPROCESSING:
+#
+# 1. BẬT MULTIPROCESSING:
+#    - Đặt 'use_multiprocessing': True trong CONFIG
+#    - Đặt 'num_processes': N (N = số processes muốn chạy song song)
+#    - ⚠️ Cần file federated_worker.py trong cùng thư mục
+#
+# 2. CHỌN SỐ PROCESSES PHÙ HỢP:
+#    - Với CPU: num_processes = số CPU cores (ví dụ: 4-8)
+#    - Với 1 GPU: num_processes = 1
+#    - Với 2 GPUs (Kaggle): num_processes = 2 (khuyến nghị)
+#    - Với nhiều GPUs: num_processes = num_gpus
+#    - Lưu ý: Mỗi process cần RAM riêng, cần đủ RAM cho tất cả processes
+#
+# 3. LỢI ÍCH:
+#    - Tăng tốc đáng kể khi train nhiều clients (có thể nhanh gấp 2-5 lần)
+#    - Tận dụng được nhiều GPU nếu có
+#    - Mỗi client train hoàn toàn độc lập, không ảnh hưởng lẫn nhau
+#
+# 4. LƯU Ý:
+#    - Cần đủ RAM/VRAM cho tất cả processes
+#    - Nếu gặp OOM (Out Of Memory), giảm num_processes hoặc batch_size
+#    - Với 1 GPU, không nên dùng quá 3 processes
+#
 # ============================================================================
 
-def _client_training_worker(args_tuple):
+def _client_training_worker_deprecated(args_tuple):
     """
     Hàm worker (helper) để chạy trong một process riêng biệt.
     Có tqdm riêng cho từng worker.
+
+    QUAN TRỌNG: Hàm này chạy trong process riêng với spawn context,
+    nên cần import lại tất cả dependencies và tránh chia sẻ CUDA tensors.
     """
     import torch
     import torch.nn as nn
@@ -917,6 +970,10 @@ def _client_training_worker(args_tuple):
     from collections import OrderedDict
     from tqdm.auto import tqdm as _tqdm
     import time as _time
+    import os
+
+    # Tắt cảnh báo CUDA không cần thiết trong worker processes
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
     class CNN_GRU_Model_Worker(nn.Module):
         def __init__(self, input_shape, num_classes=2):
@@ -998,14 +1055,25 @@ def _client_training_worker(args_tuple):
     try:
         (client_id, model_state_dict, train_data, device_id, config) = args_tuple
 
+        # Debug: In ra để biết worker đã start
+        print(f"   🚀 Worker cho Client {client_id} đã start (device: {device_id})")
+
         num_epochs = config['local_epochs']
         learning_rate = config['learning_rate']
         algorithm = config['algorithm']
         mu = config['mu']
         batch_size = config['batch_size']
 
+        # Thiết lập device cho worker process
         if device_id != 'cpu' and torch.cuda.is_available():
-            device = torch.device(f'cuda:{device_id}')
+            # Đảm bảo device_id hợp lệ
+            num_gpus = torch.cuda.device_count()
+            if isinstance(device_id, int) and device_id < num_gpus:
+                device = torch.device(f'cuda:{device_id}')
+                torch.cuda.set_device(device)  # Set device mặc định cho process này
+            else:
+                device = torch.device('cuda:0')  # Fallback to first GPU
+                torch.cuda.set_device(0)
         else:
             device = torch.device('cpu')
 
@@ -1077,7 +1145,15 @@ def _client_training_worker(args_tuple):
             total_loss += epoch_loss
             total_samples += epoch_samples
 
+            # Dọn dẹp CUDA cache sau mỗi epoch để tránh OOM
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
         avg_loss = total_loss / max(1, total_samples)
+
+        # Dọn dẹp cuối cùng trước khi return
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         return {
             'client_id': client_id,
@@ -1087,9 +1163,16 @@ def _client_training_worker(args_tuple):
         }
 
     except Exception as e:
-        print(f"❌ Lỗi trong worker client {client_id}: {e}")
+        print(f"\n{'='*60}")
+        print(f"❌ LỖI TRONG WORKER CLIENT {client_id}")
+        print(f"{'='*60}")
+        print(f"Device: {device_id}")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {e}")
+        print(f"{'='*60}")
         import traceback
         traceback.print_exc()
+        print(f"{'='*60}\n")
         return None
 
 
@@ -1132,6 +1215,18 @@ def train_round_multiprocessing(
     Train 1 round với multiprocessing - chạy nhiều client song song.
     Có tqdm cho danh sách clients.
     """
+    # Kiểm tra worker module có sẵn không
+    if not WORKER_MODULE_AVAILABLE or client_training_worker is None:
+        print("\n" + "="*60)
+        print("❌ LỖI: Không thể sử dụng multiprocessing!")
+        print("="*60)
+        print("Nguyên nhân: File federated_worker.py không tìm thấy hoặc import lỗi")
+        print("\nGiải pháp:")
+        print("1. Tạo file federated_worker.py trong cùng thư mục")
+        print("2. HOẶC tắt multiprocessing: CONFIG['use_multiprocessing'] = False")
+        print("="*60 + "\n")
+        raise RuntimeError("federated_worker module không khả dụng. Tắt multiprocessing hoặc tạo file federated_worker.py")
+
     global_state_dict = {k: v.cpu() for k, v in server.get_global_params().items()}
 
     client_data = []
@@ -1144,12 +1239,22 @@ def train_round_multiprocessing(
         y_train = np.concatenate(y_list, axis=0)
         client_data.append((X_train, y_train))
 
-    if device == 'cuda' and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    # Cấu hình GPU allocation cho từng client
+    if device == 'cuda' and torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
-        device_ids = [i % num_gpus for i in range(config['num_clients'])]
-        print(f"   • Phân bổ {config['num_clients']} clients cho {num_gpus} GPUs.")
+        if num_gpus > 1:
+            # Phân bổ clients đều trên các GPUs (round-robin)
+            device_ids = [i % num_gpus for i in range(config['num_clients'])]
+            print(f"   • Phân bổ {config['num_clients']} clients cho {num_gpus} GPUs (round-robin).")
+            print(f"   • GPU mapping: {device_ids}")
+        else:
+            # Chỉ có 1 GPU, tất cả clients dùng chung (multiprocessing vẫn hiệu quả)
+            device_ids = [0] * config['num_clients']
+            print(f"   • Sử dụng 1 GPU cho tất cả {config['num_clients']} clients.")
+            print(f"   • ⚠️  Lưu ý: Các processes sẽ chia sẻ GPU, cần đủ VRAM!")
     else:
-        device_ids = [0 if device == 'cuda' else 'cpu'] * config['num_clients']
+        device_ids = ['cpu'] * config['num_clients']
+        print(f"   • Sử dụng CPU cho tất cả {config['num_clients']} clients.")
 
     args_list = [
         (
@@ -1163,18 +1268,54 @@ def train_round_multiprocessing(
     ]
 
     print(f"   • Bắt đầu train {config['num_clients']} clients song song với {config['num_processes']} processes...")
+    print(f"   • Đang khởi tạo process pool...")
 
+    # QUAN TRỌNG: Dùng spawn context cho CUDA
+    # - Spawn: Tạo process mới hoàn toàn, tránh CUDA fork issues
+    # - Fork: Nhanh hơn NHƯNG không tương thích CUDA (gây RuntimeError)
     mp_context = mp.get_context('spawn')
     results = []
-    with mp_context.Pool(processes=config['num_processes']) as pool:
-        for res in tqdm(
-            pool.imap_unordered(_client_training_worker, args_list),
-            total=len(args_list),
-            desc="Clients (multiprocessing)",
-            unit="client"
-        ):
-            results.append(res)
 
+    try:
+        # Tạo pool với số processes được cấu hình (spawn method)
+        print(f"   • Tạo pool với {config['num_processes']} processes (spawn method)...")
+        pool = mp_context.Pool(processes=config['num_processes'])
+
+        print(f"   • Pool đã được tạo, bắt đầu submit {len(args_list)} tasks...")
+
+        # Sử dụng imap_unordered để có thể xử lý results ngay khi sẵn sàng
+        # QUAN TRỌNG: Dùng client_training_worker từ module riêng (có thể pickle)
+        for idx, res in enumerate(tqdm(
+            pool.imap_unordered(client_training_worker, args_list),
+            total=len(args_list),
+            desc="🔄 Clients Training (Parallel)",
+            unit="client"
+        )):
+            if res is not None:
+                results.append(res)
+                print(f"   ✓ Client {res['client_id']} hoàn thành - Loss: {res['loss']:.4f}")
+            else:
+                print(f"   ✗ Một client thất bại (trả về None)")
+
+        # Đảm bảo pool kết thúc đúng cách
+        print(f"   • Đang đóng pool...")
+        pool.close()
+        pool.join()
+        print(f"   • Pool đã được đóng thành công")
+
+    except Exception as e:
+        print(f"   ❌ Lỗi trong quá trình multiprocessing: {e}")
+        import traceback
+        traceback.print_exc()
+        # Cố gắng terminate pool nếu có lỗi
+        try:
+            pool.terminate()
+            pool.join()
+        except:
+            pass
+        raise
+
+    # Kiểm tra kết quả
     results = [r for r in results if r is not None]
 
     if len(results) == 0:
@@ -1231,6 +1372,17 @@ def train_federated(server, config, train_loaders=None):
     print(f"   - Chạy song song (Multiprocessing): {use_multiprocessing}")
     if use_multiprocessing:
         print(f"   - Số Processes: {config['num_processes']}")
+        print(f"\n   ⚡ MULTIPROCESSING ĐÃ ĐƯỢC BẬT!")
+        print(f"   • {config['num_clients']} clients sẽ chạy song song với {config['num_processes']} processes")
+        if device == 'cuda':
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            print(f"   • Số GPU khả dụng: {num_gpus}")
+            if num_gpus > 0:
+                print(f"   • Clients sẽ được phân bổ tự động lên các GPUs")
+                if config['num_processes'] > num_gpus * 2:
+                    print(f"   ⚠️  CẢNH BÁO: {config['num_processes']} processes cho {num_gpus} GPU(s) có thể gây OOM!")
+                    print(f"   💡 Khuyến nghị: Giảm num_processes xuống {num_gpus * 2} hoặc ít hơn")
+        print(f"   • Mỗi process sẽ train độc lập, sau đó aggregate kết quả")
     if algorithm == 'fedprox':
         print(f"   - Mu (proximal term): {config['mu']}")
 
@@ -1566,6 +1718,42 @@ def evaluate_and_save_results(server, history, config, output_dir, data_stats, t
 # ============================================================================
 
 def main():
+    # ============================================================================
+    # 🔧 THIẾT LẬP MULTIPROCESSING CHO CUDA
+    # ============================================================================
+    # QUAN TRỌNG: Với CUDA, PHẢI dùng 'spawn' method để tránh lỗi:
+    # "Cannot re-initialize CUDA in forked subprocess"
+    #
+    # Lưu ý khi chạy trong Jupyter notebook:
+    # - Spawn có thể gây pickle error vì worker không import được __main__
+    # - Nên chạy script này như file .py thay vì trong notebook:
+    #   $ python run_federated_training.py
+
+    # Kiểm tra xem có đang chạy trong notebook không
+    try:
+        from IPython import get_ipython
+        if get_ipython() is not None and 'IPKernelApp' in get_ipython().config:
+            in_notebook = True
+            print("⚠️  CẢNH BÁO: Đang chạy trong Jupyter notebook!")
+            print("   Multiprocessing với CUDA trong notebook có thể gặp vấn đề.")
+            print("   Khuyến nghị: Chạy script như file .py để tối ưu hiệu suất:")
+            print("   $ python run_federated_training.py\n")
+        else:
+            in_notebook = False
+    except:
+        in_notebook = False
+
+    # Set spawn method CHO CUDA (bắt buộc để tránh fork issues)
+    current_method = mp.get_start_method(allow_none=True)
+    if current_method != 'spawn':
+        try:
+            mp.set_start_method('spawn', force=True)
+            print(f"✅ Đã thiết lập multiprocessing method: 'spawn' (required for CUDA)")
+        except RuntimeError:
+            print(f"ℹ️  Multiprocessing method: {mp.get_start_method()}")
+    else:
+        print(f"ℹ️  Multiprocessing method: spawn (already set)")
+
     config = CONFIG
     start_time = datetime.now()
 
