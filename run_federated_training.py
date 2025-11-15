@@ -908,7 +908,24 @@ def initialize_federated_system(
 
 
 # ============================================================================
-# 💡 BƯỚC 8: CÁC HÀM HỖ TRỢ MULTIPROCESSING 💡
+# 💡 BƯỚC 8: IMPORT WORKER MODULE (QUAN TRỌNG CHO MULTIPROCESSING)
+# ============================================================================
+# QUAN TRỌNG: Worker function PHẢI ở file riêng để spawn method có thể import.
+# Jupyter/Kaggle không thể pickle functions trong __main__ module.
+
+try:
+    from federated_worker import client_training_worker
+    WORKER_MODULE_AVAILABLE = True
+    print("✅ Đã import federated_worker module thành công")
+except ImportError as e:
+    print(f"⚠️  CẢNH BÁO: Không thể import federated_worker module: {e}")
+    print(f"   Multiprocessing sẽ KHÔNG hoạt động trong Jupyter/Kaggle!")
+    print(f"   Giải pháp: Tạo file federated_worker.py hoặc tắt multiprocessing")
+    WORKER_MODULE_AVAILABLE = False
+    client_training_worker = None
+
+# ============================================================================
+# 💡 CÁC HÀM HỖ TRỢ MULTIPROCESSING 💡
 # ============================================================================
 #
 # 🚀 HƯỚNG DẪN SỬ DỤNG MULTIPROCESSING:
@@ -916,11 +933,13 @@ def initialize_federated_system(
 # 1. BẬT MULTIPROCESSING:
 #    - Đặt 'use_multiprocessing': True trong CONFIG
 #    - Đặt 'num_processes': N (N = số processes muốn chạy song song)
+#    - ⚠️ Cần file federated_worker.py trong cùng thư mục
 #
 # 2. CHỌN SỐ PROCESSES PHÙ HỢP:
 #    - Với CPU: num_processes = số CPU cores (ví dụ: 4-8)
-#    - Với 1 GPU: num_processes = 2-3 (tránh OOM)
-#    - Với nhiều GPUs: num_processes = num_gpus * 2 hoặc = num_clients
+#    - Với 1 GPU: num_processes = 1
+#    - Với 2 GPUs (Kaggle): num_processes = 2 (khuyến nghị)
+#    - Với nhiều GPUs: num_processes = num_gpus
 #    - Lưu ý: Mỗi process cần RAM riêng, cần đủ RAM cho tất cả processes
 #
 # 3. LỢI ÍCH:
@@ -935,7 +954,7 @@ def initialize_federated_system(
 #
 # ============================================================================
 
-def _client_training_worker(args_tuple):
+def _client_training_worker_deprecated(args_tuple):
     """
     Hàm worker (helper) để chạy trong một process riêng biệt.
     Có tqdm riêng cho từng worker.
@@ -1196,6 +1215,18 @@ def train_round_multiprocessing(
     Train 1 round với multiprocessing - chạy nhiều client song song.
     Có tqdm cho danh sách clients.
     """
+    # Kiểm tra worker module có sẵn không
+    if not WORKER_MODULE_AVAILABLE or client_training_worker is None:
+        print("\n" + "="*60)
+        print("❌ LỖI: Không thể sử dụng multiprocessing!")
+        print("="*60)
+        print("Nguyên nhân: File federated_worker.py không tìm thấy hoặc import lỗi")
+        print("\nGiải pháp:")
+        print("1. Tạo file federated_worker.py trong cùng thư mục")
+        print("2. HOẶC tắt multiprocessing: CONFIG['use_multiprocessing'] = False")
+        print("="*60 + "\n")
+        raise RuntimeError("federated_worker module không khả dụng. Tắt multiprocessing hoặc tạo file federated_worker.py")
+
     global_state_dict = {k: v.cpu() for k, v in server.get_global_params().items()}
 
     client_data = []
@@ -1253,8 +1284,9 @@ def train_round_multiprocessing(
         print(f"   • Pool đã được tạo, bắt đầu submit {len(args_list)} tasks...")
 
         # Sử dụng imap_unordered để có thể xử lý results ngay khi sẵn sàng
+        # QUAN TRỌNG: Dùng client_training_worker từ module riêng (có thể pickle)
         for idx, res in enumerate(tqdm(
-            pool.imap_unordered(_client_training_worker, args_list),
+            pool.imap_unordered(client_training_worker, args_list),
             total=len(args_list),
             desc="🔄 Clients Training (Parallel)",
             unit="client"
