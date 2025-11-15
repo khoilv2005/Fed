@@ -103,10 +103,14 @@ CONFIG = {
 
     # Multiprocessing
     'use_multiprocessing': True,   # Chạy clients song song
-    'num_processes': 5,            # Số processes = số clients để tối ưu
-                                   # Lưu ý: Nếu RAM/GPU không đủ, giảm num_processes xuống 2-3
-                                   # Với 1 GPU: nên dùng 2-3 processes để tránh OOM
-                                   # Với nhiều GPUs: có thể dùng num_clients processes
+    'num_processes': 2,            # QUAN TRỌNG: Với 2 GPUs, dùng 2 processes (1 process/GPU)
+                                   # - Tránh nhiều processes cùng dùng 1 GPU gây OOM
+                                   # - Mỗi process sẽ train 1 client tại 1 thời điểm
+                                   # - Pool sẽ tự động lấy client tiếp theo khi worker rảnh
+                                   # Lưu ý:
+                                   # - Với 1 GPU: num_processes = 1
+                                   # - Với 2 GPUs: num_processes = 2 (khuyến nghị)
+                                   # - Với 4+ GPUs: num_processes = num_gpus
 
     # Visualization
     'eval_every': 1,
