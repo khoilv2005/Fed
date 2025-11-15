@@ -1235,15 +1235,16 @@ def train_round_multiprocessing(
     print(f"   • Bắt đầu train {config['num_clients']} clients song song với {config['num_processes']} processes...")
     print(f"   • Đang khởi tạo process pool...")
 
-    # Sử dụng default context (fork trên Linux, spawn trên Windows/macOS)
-    # Fork: Nhanh, hiệu quả, workers kế thừa memory của parent
-    # Spawn: Chậm hơn nhưng an toàn hơn, tạo process hoàn toàn mới
+    # QUAN TRỌNG: Dùng spawn context cho CUDA
+    # - Spawn: Tạo process mới hoàn toàn, tránh CUDA fork issues
+    # - Fork: Nhanh hơn NHƯNG không tương thích CUDA (gây RuntimeError)
+    mp_context = mp.get_context('spawn')
     results = []
 
     try:
-        # Tạo pool với số processes được cấu hình (sử dụng default method)
-        print(f"   • Tạo pool với {config['num_processes']} processes...")
-        pool = mp.Pool(processes=config['num_processes'])
+        # Tạo pool với số processes được cấu hình (spawn method)
+        print(f"   • Tạo pool với {config['num_processes']} processes (spawn method)...")
+        pool = mp_context.Pool(processes=config['num_processes'])
 
         print(f"   • Pool đã được tạo, bắt đầu submit {len(args_list)} tasks...")
 
@@ -1684,12 +1685,38 @@ def main():
     # ============================================================================
     # 🔧 THIẾT LẬP MULTIPROCESSING CHO CUDA
     # ============================================================================
-    # Sử dụng default start method của Python:
-    # - Linux: 'fork' (nhanh, hiệu quả, tương thích CUDA nếu không init context trước)
-    # - Windows/macOS: 'spawn' (an toàn hơn nhưng chậm hơn)
-    # Không set 'spawn' vì gây lỗi pickle với functions trong __main__
+    # QUAN TRỌNG: Với CUDA, PHẢI dùng 'spawn' method để tránh lỗi:
+    # "Cannot re-initialize CUDA in forked subprocess"
+    #
+    # Lưu ý khi chạy trong Jupyter notebook:
+    # - Spawn có thể gây pickle error vì worker không import được __main__
+    # - Nên chạy script này như file .py thay vì trong notebook:
+    #   $ python run_federated_training.py
 
-    print(f"ℹ️  Multiprocessing start method: {mp.get_start_method()}")
+    # Kiểm tra xem có đang chạy trong notebook không
+    try:
+        from IPython import get_ipython
+        if get_ipython() is not None and 'IPKernelApp' in get_ipython().config:
+            in_notebook = True
+            print("⚠️  CẢNH BÁO: Đang chạy trong Jupyter notebook!")
+            print("   Multiprocessing với CUDA trong notebook có thể gặp vấn đề.")
+            print("   Khuyến nghị: Chạy script như file .py để tối ưu hiệu suất:")
+            print("   $ python run_federated_training.py\n")
+        else:
+            in_notebook = False
+    except:
+        in_notebook = False
+
+    # Set spawn method CHO CUDA (bắt buộc để tránh fork issues)
+    current_method = mp.get_start_method(allow_none=True)
+    if current_method != 'spawn':
+        try:
+            mp.set_start_method('spawn', force=True)
+            print(f"✅ Đã thiết lập multiprocessing method: 'spawn' (required for CUDA)")
+        except RuntimeError:
+            print(f"ℹ️  Multiprocessing method: {mp.get_start_method()}")
+    else:
+        print(f"ℹ️  Multiprocessing method: spawn (already set)")
 
     config = CONFIG
     start_time = datetime.now()
