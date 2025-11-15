@@ -1235,14 +1235,15 @@ def train_round_multiprocessing(
     print(f"   • Bắt đầu train {config['num_clients']} clients song song với {config['num_processes']} processes...")
     print(f"   • Đang khởi tạo process pool...")
 
-    # QUAN TRỌNG: Sử dụng 'spawn' context cho CUDA compatibility
-    mp_context = mp.get_context('spawn')
+    # Sử dụng default context (fork trên Linux, spawn trên Windows/macOS)
+    # Fork: Nhanh, hiệu quả, workers kế thừa memory của parent
+    # Spawn: Chậm hơn nhưng an toàn hơn, tạo process hoàn toàn mới
     results = []
 
     try:
-        # Tạo pool với số processes được cấu hình
+        # Tạo pool với số processes được cấu hình (sử dụng default method)
         print(f"   • Tạo pool với {config['num_processes']} processes...")
-        pool = mp_context.Pool(processes=config['num_processes'])
+        pool = mp.Pool(processes=config['num_processes'])
 
         print(f"   • Pool đã được tạo, bắt đầu submit {len(args_list)} tasks...")
 
@@ -1683,14 +1684,12 @@ def main():
     # ============================================================================
     # 🔧 THIẾT LẬP MULTIPROCESSING CHO CUDA
     # ============================================================================
-    # QUAN TRỌNG: Set start method PHẢI được gọi trong main() và được bảo vệ
-    # bởi if __name__ == "__main__": để tránh issues khi spawn processes
-    try:
-        mp.set_start_method('spawn', force=True)
-        print("✅ Đã thiết lập multiprocessing start method: 'spawn'")
-    except RuntimeError as e:
-        # Start method đã được set rồi, không cần set lại
-        print(f"ℹ️  Multiprocessing start method đã được thiết lập trước đó: {mp.get_start_method()}")
+    # Sử dụng default start method của Python:
+    # - Linux: 'fork' (nhanh, hiệu quả, tương thích CUDA nếu không init context trước)
+    # - Windows/macOS: 'spawn' (an toàn hơn nhưng chậm hơn)
+    # Không set 'spawn' vì gây lỗi pickle với functions trong __main__
+
+    print(f"ℹ️  Multiprocessing start method: {mp.get_start_method()}")
 
     config = CONFIG
     start_time = datetime.now()
