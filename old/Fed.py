@@ -9,7 +9,7 @@ from collections import OrderedDict
 from tqdm.auto import tqdm  # progress bar
 
 # Import CNN-GRU model từ model.py
-from model import CNN_GRU_Model, build_cnn_gru_model
+from old.model import CNN_GRU_Model, build_cnn_gru_model
 
 
 class FederatedClient:
@@ -214,18 +214,20 @@ class FederatedServer:
     Quản lý global model và thực hiện aggregation
     """
     def __init__(
-        self, 
+        self,
         model: nn.Module,
         clients: List[FederatedClient],
         test_loader: DataLoader = None,
+        client_test_loaders: List[DataLoader] = None,
         device: str = 'cpu'
     ):
         self.global_model = model
         self.clients = clients
         self.test_loader = test_loader
+        self.client_test_loaders = client_test_loaders  # Hỗ trợ list test loaders
         self.device = device
         self.global_model.to(device)
-        
+
         # History để track performance
         self.history = {
             'train_loss': [],
@@ -381,30 +383,41 @@ class FederatedServer:
     
     def evaluate_global(self) -> Dict:
         """Đánh giá global model trên test set"""
-        if self.test_loader is None:
+        # Hỗ trợ cả test_loader (1 loader) và client_test_loaders (list loaders)
+        test_loaders = []
+
+        if self.client_test_loaders is not None:
+            # Ưu tiên dùng client_test_loaders nếu có
+            test_loaders = self.client_test_loaders
+        elif self.test_loader is not None:
+            # Fallback về test_loader đơn lẻ
+            test_loaders = [self.test_loader]
+        else:
+            # Không có test loader nào
             return {'accuracy': 0.0, 'loss': 0.0}
-        
+
         self.global_model.eval()
         criterion = nn.CrossEntropyLoss()
-        
+
         total_loss = 0.0
         correct = 0
         total = 0
-        
+
         with torch.no_grad():
-            for data, target in self.test_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = self.global_model(data)
-                loss = criterion(output, target)
-                
-                total_loss += loss.item() * data.size(0)
-                pred = output.argmax(dim=1)
-                correct += pred.eq(target).sum().item()
-                total += data.size(0)
-        
+            for loader in test_loaders:
+                for data, target in loader:
+                    data, target = data.to(self.device), target.to(self.device)
+                    output = self.global_model(data)
+                    loss = criterion(output, target)
+
+                    total_loss += loss.item() * data.size(0)
+                    pred = output.argmax(dim=1)
+                    correct += pred.eq(target).sum().item()
+                    total += data.size(0)
+
         accuracy = correct / total if total > 0 else 0.0
         avg_loss = total_loss / total if total > 0 else 0.0
-        
+
         return {
             'accuracy': accuracy,
             'loss': avg_loss

@@ -81,16 +81,7 @@ class CNN_GRU_Model(nn.Module):
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x):
-        """
-        Forward pass
-        Args:
-            x: tensor shape (batch_size, seq_length) hoặc (batch_size, seq_length, 1)
-        Returns:
-            output: tensor shape (batch_size, num_classes)
-        """
-        # Đảm bảo input shape đúng
         if len(x.shape) == 2:
-            # (batch_size, seq_length) -> (batch_size, seq_length, 1)
             x = x.unsqueeze(-1)
 
         batch_size = x.size(0)

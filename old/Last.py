@@ -25,7 +25,8 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 from tqdm.auto import tqdm  # ✅ Thêm tqdm cho progress bar
 import time  # ✅ Để đo thời gian mỗi batch
-
+import threading  # ← THÊM DÒNG NÀY
+from concurrent.futures import ThreadPoolExecutor  # ← THÊM DÒNG NÀY
 
 # Hàm check gpu
 def check_and_setup_gpu(config: Dict) -> str:
@@ -77,8 +78,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG = {
     # ⬇️ CHỈNH ĐƯỜNG DẪN NÀY (TRÊN COLAB CẦN MOUNT DRIVE TRƯỚC) ⬇️
-    'data_dir': '/content/drive/MyDrive/Fed-Data/5-Client',
-    'output_dir': '/content/drive/MyDrive/Fed-Data/5-Client/Results',  # Lưu kết quả
+    'data_dir': './data/federated_splits',
+    'output_dir': './results',
 
     'num_clients': 5,
 
@@ -88,10 +89,10 @@ CONFIG = {
 
     # Training params
     'algorithm': 'fedavg',     # 'fedavg' hoặc 'fedprox'
-    'num_rounds': 10,           # Giảm số round cho chạy thử nghiệm nhanh
+    'num_rounds': 5,           # Giảm số round cho chạy thử nghiệm nhanh
     'local_epochs': 5,         # 1 Epoch/Vòng
     'learning_rate': 0.001,
-    'batch_size': 1024,        # Batch size lớn (GPU 15GB ok)
+    'batch_size': 2048,        # Batch size lớn (GPU 15GB ok)
     'client_fraction': 1.0,    # Tỉ lệ clients tham gia mỗi round
 
     # FedProx specific
@@ -102,8 +103,8 @@ CONFIG = {
     'force_gpu': True,  # Set False nếu muốn cho phép chạy trên CPU
 
     # Multiprocessing
-    'use_multiprocessing': False,  # Chạy clients song song
-    'num_processes': 1,           # Giảm số processes cho chạy thử nghiệm nhanh
+    'use_multiprocessing': False,  # 👈 QUAN TRỌNG: BẬT LÊN
+    'num_processes': 2,           # 👈 QUAN TRỌNG: Đặt là 2, 4, hoặc số CPU cores
 
     # Visualization
     'eval_every': 1,
@@ -808,10 +809,10 @@ def load_federated_data(data_dir, num_clients, batch_size, device='cpu'):
         test_dataset = NumpyDataset(X_test, y_test, device)
 
         train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True, drop_last=False
+            train_dataset, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=2, pin_memory=True,   persistent_workers=True      
         )
         test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False, drop_last=False
+            test_dataset, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=2, pin_memory=True,   persistent_workers=True      
         )
         train_loaders.append(train_loader)
         test_loaders.append(test_loader)
@@ -906,50 +907,65 @@ def initialize_federated_system(
 
 def _client_training_worker(args_tuple):
     """
-    Hàm worker (helper) để chạy trong một process riêng biệt.
-    Có tqdm riêng cho từng worker.
+    Worker function để train 1 client trong multiprocessing environment.
+    ✅ ĐÃ FIX: Disable tqdm để tránh deadlock trên Jupyter/Colab
     """
     import torch
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, TensorDataset
     import numpy as np
-    from collections import OrderedDict
-    from tqdm.auto import tqdm as _tqdm
     import time as _time
+    # from tqdm.auto import tqdm as _tqdm  # ← KHÔNG DÙNG TQDM NỮA!
 
     class CNN_GRU_Model_Worker(nn.Module):
+        """Model definition trong worker (để tránh pickling error)"""
         def __init__(self, input_shape, num_classes=2):
             super(CNN_GRU_Model_Worker, self).__init__()
+            
             if isinstance(input_shape, tuple):
                 seq_length = input_shape[0]
             else:
                 seq_length = input_shape
+            
             self.input_shape = input_shape
             self.num_classes = num_classes
-            self.conv1 = nn.Conv1d(1, 64, 3, padding=1)
+            
+            # CNN Module
+            self.conv1 = nn.Conv1d(1, 64, kernel_size=3, padding=1)
             self.bn1 = nn.BatchNorm1d(64)
             self.pool1 = nn.MaxPool1d(2)
             self.dropout_cnn1 = nn.Dropout(0.2)
-            self.conv2 = nn.Conv1d(64, 128, 3, padding=1)
+            
+            self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
             self.bn2 = nn.BatchNorm1d(128)
             self.pool2 = nn.MaxPool1d(2)
             self.dropout_cnn2 = nn.Dropout(0.2)
-            self.conv3 = nn.Conv1d(128, 256, 3, padding=1)
+            
+            self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
             self.bn3 = nn.BatchNorm1d(256)
             self.pool3 = nn.MaxPool1d(2)
             self.dropout_cnn3 = nn.Dropout(0.3)
-
+            
             def conv_output_shape(L_in, kernel_size=1, stride=1, padding=0, dilation=1):
                 return (L_in + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
-
+            
             cnn_output_length = seq_length
-            for _ in range(3):
-                cnn_output_length = conv_output_shape(cnn_output_length, kernel_size=2, stride=2)
+            cnn_output_length = conv_output_shape(cnn_output_length, 3, 1, 1)
+            cnn_output_length = conv_output_shape(cnn_output_length, 2, 2)
+            cnn_output_length = conv_output_shape(cnn_output_length, 3, 1, 1)
+            cnn_output_length = conv_output_shape(cnn_output_length, 2, 2)
+            cnn_output_length = conv_output_shape(cnn_output_length, 3, 1, 1)
+            cnn_output_length = conv_output_shape(cnn_output_length, 2, 2)
+            
             self.cnn_output_size = 256 * cnn_output_length
+            
+            # GRU Module
             self.gru1 = nn.GRU(1, 128, batch_first=True)
             self.gru2 = nn.GRU(128, 64, batch_first=True)
             self.gru_output_size = 64
+            
+            # MLP Module
             concat_size = self.cnn_output_size + self.gru_output_size
             self.dense1 = nn.Linear(concat_size, 256)
             self.bn_mlp1 = nn.BatchNorm1d(256)
@@ -959,20 +975,26 @@ def _client_training_worker(args_tuple):
             self.dropout2 = nn.Dropout(0.3)
             self.output = nn.Linear(128, num_classes)
             self.relu = nn.ReLU()
-
+        
         def forward(self, x):
             if len(x.shape) == 2:
                 x = x.unsqueeze(-1)
             batch_size = x.size(0)
+            
+            # CNN
             x_cnn = x.permute(0, 2, 1)
             x_cnn = self.dropout_cnn1(self.pool1(self.relu(self.bn1(self.conv1(x_cnn)))))
             x_cnn = self.dropout_cnn2(self.pool2(self.relu(self.bn2(self.conv2(x_cnn)))))
             x_cnn = self.dropout_cnn3(self.pool3(self.relu(self.bn3(self.conv3(x_cnn)))))
             cnn_output = x_cnn.view(batch_size, -1)
+            
+            # GRU
             x_gru = x
             x_gru, _ = self.gru1(x_gru)
             x_gru, _ = self.gru2(x_gru)
             gru_output = x_gru[:, -1, :]
+            
+            # Concat + MLP
             concatenated = torch.cat([cnn_output, gru_output], dim=1)
             x = self.dense1(concatenated)
             if x.shape[0] > 1:
@@ -1004,6 +1026,12 @@ def _client_training_worker(args_tuple):
         mu = config['mu']
         batch_size = config['batch_size']
 
+        # ✅ FIX 1: FORCE CPU để tránh CUDA deadlock (nếu cần)
+        # Uncomment dòng dưới nếu vẫn bị treo với GPU:
+        # device = torch.device('cpu')
+        # print(f"[Worker {client_id}] Forced CPU mode for stability")
+        
+        # Hoặc giữ nguyên logic GPU (nếu không bị treo):
         if device_id != 'cpu' and torch.cuda.is_available():
             device = torch.device(f'cuda:{device_id}')
         else:
@@ -1031,14 +1059,16 @@ def _client_training_worker(args_tuple):
             epoch_loss = 0.0
             epoch_samples = 0
 
-            pbar = _tqdm(
-                train_loader,
-                desc=f"[Worker Client {client_id}] Epoch {epoch+1}/{num_epochs}",
-                unit="batch",
-                leave=False
-            )
+            # ✅ FIX 2: KHÔNG DÙNG TQDM (gây deadlock trong subprocess)
+            # BEFORE: pbar = _tqdm(train_loader, ...)
+            # AFTER:
+            pbar = train_loader  # ← Dùng iterator thông thường
+            
+            # In log đơn giản thay vì progress bar
+            if epoch == 0:
+                print(f"[Worker {client_id}] Starting training: {len(train_loader)} batches, {len(X_train)} samples")
 
-            for data, target in pbar:
+            for batch_idx, (data, target) in enumerate(pbar):
                 batch_start = _time.time()
 
                 data, target = data.to(device), target.to(device)
@@ -1054,30 +1084,29 @@ def _client_training_worker(args_tuple):
                             global_param = model_state_dict[name].to(device)
                             proximal_term += torch.sum((param - global_param) ** 2)
                     loss = ce_loss + (mu / 2) * proximal_term
-                    prox_val = float(((mu / 2) * proximal_term).detach().cpu().item())
                 else:
                     loss = ce_loss
-                    prox_val = 0.0
 
                 loss.backward()
                 optimizer.step()
 
-                batch_time = _time.time() - batch_start
-
                 epoch_loss += ce_loss.item() * data.size(0)
                 epoch_samples += data.size(0)
 
-                pbar.set_postfix({
-                    "ce": f"{ce_loss.item():.4f}",
-                    "prox": f"{prox_val:.2e}",
-                    "lr": f"{optimizer.param_groups[0]['lr']:.1e}",
-                    "bt": f"{batch_time*1000:.0f}ms"
-                })
+                # ✅ FIX 3: KHÔNG GỌI pbar.set_postfix()
+                # (vì pbar không phải tqdm nữa)
+                # REMOVED: pbar.set_postfix({...})
+
+            # In log sau mỗi epoch
+            avg_epoch_loss = epoch_loss / max(1, epoch_samples)
+            print(f"[Worker {client_id}] Epoch {epoch+1}/{num_epochs} completed - Avg Loss: {avg_epoch_loss:.4f}")
 
             total_loss += epoch_loss
             total_samples += epoch_samples
 
         avg_loss = total_loss / max(1, total_samples)
+        
+        print(f"[Worker {client_id}] ✓ Training completed - Final Loss: {avg_loss:.4f}")
 
         return {
             'client_id': client_id,
@@ -1087,7 +1116,7 @@ def _client_training_worker(args_tuple):
         }
 
     except Exception as e:
-        print(f"❌ Lỗi trong worker client {client_id}: {e}")
+        print(f"❌ [Worker {client_id}] Error: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -1120,6 +1149,139 @@ def aggregate_models_fedavg_parallel(client_results: List[Dict]) -> OrderedDict:
                     aggregated_params[key] = param
 
     return aggregated_params
+
+def train_round_threading(server, config, train_loaders, device='cuda'):
+    """
+    Train 1 round với THREADING - chạy nhiều client song song trên GPU.
+    
+    ✅ ƯU ĐIỂM:
+    - Tương thích Jupyter/Colab (KHÔNG deadlock)
+    - Chia sẻ GPU giữa threads (không conflict)
+    - Có thể dùng tqdm bình thường
+    - Nhanh hơn sequential mode
+    - Đơn giản hơn multiprocessing
+    
+    Args:
+        server: FederatedServer instance
+        config: Dict cấu hình
+        train_loaders: List of DataLoaders (KHÔNG SỬ DỤNG - chỉ để tương thích API)
+        device: 'cuda' hoặc 'cpu'
+    
+    Returns:
+        Dict với train_loss và num_clients
+    """
+    
+    # Lấy global params và distribute cho clients
+    global_params = server.get_global_params()
+    server.distribute_model(server.clients)
+    
+    # Chuẩn bị
+    num_selected = max(1, int(len(server.clients) * config.get('client_fraction', 1.0)))
+    selected_clients = np.random.choice(server.clients, num_selected, replace=False)
+    
+    algorithm = config['algorithm']
+    num_epochs = config['local_epochs']
+    learning_rate = config['learning_rate']
+    mu = config.get('mu', 0.01)
+    num_workers = config.get('num_processes', 2)  # Số threads
+    
+    print(f"→ [Round] Chọn {len(selected_clients)} clients để train (THREADING mode)")
+    print(f"   • Device: {device}")
+    print(f"   • Num threads: {num_workers}")
+    print(f"   • Algorithm: {algorithm.upper()}")
+    
+    # Container cho results
+    client_results = []
+    results_lock = threading.Lock()
+    
+    # Progress tracking
+    completed = {'count': 0}
+    completed_lock = threading.Lock()
+    
+    def train_one_client(client_idx, client):
+        """
+        Train 1 client trong thread.
+        Thread-safe và chia sẻ GPU.
+        """
+        try:
+            client_id = client.client_id
+            num_batches = len(client.train_loader)
+            num_samples = len(client.train_loader.dataset)
+            
+            # In thông tin client
+            print(f"\n→ [Thread] Training Client {client_id} - "
+                  f"{num_samples:,} samples, {num_batches} batches")
+            
+            # Train dựa trên algorithm
+            if algorithm == 'fedavg':
+                result = client.train_fedavg(
+                    epochs=num_epochs,
+                    learning_rate=learning_rate,
+                    verbose=1  # ✅ Có thể dùng verbose vì threading OK với tqdm
+                )
+            elif algorithm == 'fedprox':
+                result = client.train_fedprox(
+                    epochs=num_epochs,
+                    global_params=global_params,
+                    mu=mu,
+                    learning_rate=learning_rate,
+                    verbose=1  # ✅ Có thể dùng verbose
+                )
+            else:
+                raise ValueError(f"Unknown algorithm: {algorithm}")
+            
+            # Lưu kết quả (thread-safe)
+            with results_lock:
+                client_results.append(result)
+            
+            # Cập nhật progress
+            with completed_lock:
+                completed['count'] += 1
+                print(f"   ✓ Client {client_id} completed ({completed['count']}/{len(selected_clients)}) - "
+                      f"Avg Loss: {result['loss']:.4f}")
+            
+        except Exception as e:
+            print(f"   ✗ Client {client_id} FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Chạy parallel với ThreadPoolExecutor
+    print(f"\n→ [Round] Bắt đầu training {len(selected_clients)} clients với {num_workers} threads...")
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit tất cả tasks
+        futures = []
+        for idx, client in enumerate(selected_clients):
+            future = executor.submit(train_one_client, idx, client)
+            futures.append(future)
+        
+        # Đợi tất cả hoàn thành
+        for future in futures:
+            try:
+                future.result()  # Raise exception nếu có
+            except Exception as e:
+                print(f"   ✗ Thread error: {e}")
+    
+    # Kiểm tra kết quả
+    if len(client_results) == 0:
+        raise RuntimeError("❌ Tất cả clients đều thất bại!")
+    
+    print(f"\n→ [Round] Đang aggregate {len(client_results)} models...")
+    
+    # Aggregate sử dụng hàm có sẵn của server
+    aggregated_params = server.aggregate_fedavg(client_results)
+    server.set_global_params(aggregated_params)
+    
+    # Tính average loss
+    avg_loss = float(np.mean([r['loss'] for r in client_results]))
+    
+    print(f"→ [Round] Hoàn thành, Loss trung bình: {avg_loss:.4f}")
+    
+    return {
+        'train_loss': avg_loss,
+        'num_clients': len(client_results)
+    }
+
 
 
 def train_round_multiprocessing(
@@ -1234,7 +1396,7 @@ def train_federated(server, config, train_loaders=None):
     if algorithm == 'fedprox':
         print(f"   - Mu (proximal term): {config['mu']}")
 
-    if eval_every > 0:
+    if False:
         print("\n📊 Đánh giá mô hình toàn cục (chưa huấn luyện)...")
         eval_result = server.evaluate_global()
         history['train_loss'].append(None)
@@ -1254,19 +1416,20 @@ def train_federated(server, config, train_loaders=None):
         print(f"{'='*60}")
 
         if use_multiprocessing:
-            if train_loaders is None:
-                raise ValueError("train_loaders là bắt buộc khi dùng multiprocessing")
-
+            # ✅ DÙNG THREADING thay vì multiprocessing
+            print("📝 Chế độ: THREADING - Clients chạy song song trên GPU (nhanh & ổn định)...")
+            
             worker_config = config.copy()
             worker_config['local_epochs'] = local_epochs
             worker_config['learning_rate'] = learning_rate
             worker_config['algorithm'] = algorithm
             worker_config['mu'] = config.get('mu', 0.01)
+            worker_config['client_fraction'] = client_fraction
 
-            round_result = train_round_multiprocessing(
+            round_result = train_round_threading(  # ✅ MỚI - THREADING
                 server=server,
                 config=worker_config,
-                train_loaders=train_loaders,
+                train_loaders=None,  # Không cần vì dùng server.clients trực tiếp
                 device=device
             )
 
@@ -1633,5 +1796,12 @@ def main():
         raise
 
 
+# ============================================================================
+# 🚀 ĐIỂM KHỞI CHẠY CHÍNH CỦA SCRIPT 🚀
+# ============================================================================
 if __name__ == "__main__":
+    # Khởi tạo multiprocessing để tránh lỗi trên một số hệ thống
+    
+    # Gọi hàm main để chạy
     main()
+    runtime.unassign()
